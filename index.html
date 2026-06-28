@@ -345,7 +345,7 @@
 <div id="particleOverlay">
   <canvas id="particleCanvas"></canvas>
   <button class="pcl-close" id="pclClose" data-hover>EXIT ✕</button>
-  <div class="pcl-hint" id="pclHint">指で動かす · タップで光が変わる</div>
+  <div class="pcl-hint" id="pclHint">指で電磁波を操作 · タップで遮断</div>
 </div>
 
 <div class="cursor" id="cursor"></div>
@@ -592,6 +592,7 @@ fsmenu.querySelectorAll('a').forEach(a=>a.onclick=()=>fsmenu.classList.remove('o
     uPointer:    { value:new THREE.Vector3(0,0,0) },
     uPointerAmt: { value:0 },     // pointer pull strength (eased)
     uBright:     { value:0.8 },   // tap cycles this
+    uCut:        { value:0 },     // EM-cancellation pulse 0..1, sweeps periodically
   };
   let targetPointerAmt=0;
 
@@ -672,26 +673,52 @@ fsmenu.querySelectorAll('a').forEach(a=>a.onclick=()=>fsmenu.classList.remove('o
     uniform float uTime;
     uniform vec3  uPointer;
     uniform float uPointerAmt;
+    uniform float uCut;
     attribute vec3  aOrigin;   // streak seed position
     attribute float aSeed;
     attribute float aAlong;    // 0 head -> 1 tail
     varying float vAlong;
     varying float vSpeed;
     varying float vRadial;
+    varying float vCut;
     ${noiseGLSL}
 
+    // fractal Brownian motion of curl noise -> self-similar EM-like turbulence
+    vec3 fractalFlow(vec3 p, float t){
+      vec3 sum = vec3(0.0);
+      float amp = 1.0;
+      float frq = 0.30;
+      for(int o=0; o<4; o++){
+        sum += curlNoise(p*frq + vec3(0.0,0.0,t*0.35)) * amp;
+        frq *= 2.03;          // lacunarity
+        amp *= 0.52;          // gain
+      }
+      return sum;
+    }
+
     vec3 flowAt(vec3 p, float t){
-      vec3 f  = curlNoise(p*0.30 + vec3(0.0,0.0,t*0.35));
-      vec3 f2 = curlNoise(p*0.85 - vec3(t*0.25,0.0,0.0))*0.45;
-      vec3 rad = normalize(p + 1e-4) * 0.55;   // outward "explosion" push
-      return f + f2 + rad;
+      vec3 f   = fractalFlow(p, t);
+      vec3 rad = normalize(p + 1e-4) * 0.55;   // outward radiation
+
+      // electromagnetic interference: concentric standing wave along radius
+      float R = length(p);
+      float emWave = sin(R*7.0 - t*4.0);       // the "signal" wave
+      vec3  emDir  = normalize(p + 1e-4) * emWave * 0.5;
+
+      // cancellation pulse: an inverse anti-phase wave that nullifies it.
+      // uCut sweeps 0->1; where the cut front passes, EM is inverted & damped.
+      float front = uCut * 9.0;                // expanding radius of the cut
+      float cutZone = smoothstep(0.0, 1.2, front - R) * uCut;
+      vec3  antiPhase = -emDir * 2.0 * cutZone;        // 180deg out of phase
+      vec3  flattened = -p * 0.25 * cutZone;           // pull cancelled energy inward
+
+      return f + rad + emDir + antiPhase + flattened;
     }
 
     void main(){
       vAlong = aAlong;
       float t = uTime*0.5 + aSeed*40.0;
 
-      // integrate the streak backwards in time from the head
       vec3 p = aOrigin;
       float steps = aAlong * 7.0;
       float dt = 0.05;
@@ -704,6 +731,10 @@ fsmenu.querySelectorAll('a').forEach(a=>a.onclick=()=>fsmenu.classList.remove('o
       }
       vSpeed = length(lastFlow);
       vRadial = length(aOrigin);
+
+      // mark whether this streak sits in the cancellation zone (for color)
+      float front = uCut * 9.0;
+      vCut = smoothstep(0.0, 1.4, front - length(aOrigin)) * uCut;
 
       // pointer vortex
       vec3 toP = uPointer - p;
@@ -722,8 +753,9 @@ fsmenu.querySelectorAll('a').forEach(a=>a.onclick=()=>fsmenu.classList.remove('o
     varying float vAlong;
     varying float vSpeed;
     varying float vRadial;
+    varying float vCut;
     void main(){
-      // white-hot core -> violet -> pink/blue tips
+      // active signal: white-hot core -> violet -> pink/blue tips
       vec3 cCore = vec3(1.0,1.0,1.0);
       vec3 cMid  = vec3(0.62,0.46,0.95);
       vec3 cPink = vec3(0.95,0.55,0.90);
@@ -733,9 +765,15 @@ fsmenu.querySelectorAll('a').forEach(a=>a.onclick=()=>fsmenu.classList.remove('o
       vec3 outer = mix(cPink, cBlue, fract(vRadial*0.9));
       vec3 col = mix(cCore, mix(cMid, outer, edge), edge);
 
+      // cancelled / shielded zone reads as cool cyan-teal (neutralized EM)
+      vec3 cCut = vec3(0.30, 0.85, 0.92);
+      col = mix(col, cCut, clamp(vCut,0.0,1.0));
+
       float headFade = 1.0 - vAlong;
       float coreGlow = (1.0 - edge);
-      float a = headFade * (0.10 + coreGlow*0.6 + vSpeed*0.25) * uBright;
+      // energy dims where the wave is cancelled
+      float damp = 1.0 - vCut*0.55;
+      float a = headFade * (0.10 + coreGlow*0.6 + vSpeed*0.25) * uBright * damp;
 
       gl_FragColor = vec4(col, a);
     }
@@ -812,9 +850,17 @@ fsmenu.querySelectorAll('a').forEach(a=>a.onclick=()=>fsmenu.classList.remove('o
   const pClock=new THREE.Clock();
   let autoRot=0;
   function frame(){
-    pUniforms.uTime.value=pClock.getElapsedTime();
+    const tm=pClock.getElapsedTime();
+    pUniforms.uTime.value=tm;
     // ease pointer influence
     pUniforms.uPointerAmt.value+=(targetPointerAmt-pUniforms.uPointerAmt.value)*0.06;
+
+    // EM-cancellation pulse: every ~6s a cut front sweeps outward (0->1 then resets)
+    const CYCLE=6.0;
+    const phase=(tm % CYCLE)/CYCLE;         // 0..1
+    // ramp up fast, hold, fade — gives a deliberate "cut" sweep
+    pUniforms.uCut.value = Math.min(1.0, Math.sin(phase*Math.PI)*1.4);
+
     // slow auto-rotation for depth
     autoRot+=0.0012;
     points.rotation.y=autoRot;
@@ -825,7 +871,7 @@ fsmenu.querySelectorAll('a').forEach(a=>a.onclick=()=>fsmenu.classList.remove('o
 
   function open(){
     // haptic feedback on launch (Android browsers; iOS Safari ignores this)
-    if(navigator.vibrate){ navigator.vibrate([18,40,90]); }
+    if(navigator.vibrate){ navigator.vibrate([40,30,60,30,120]); }
     overlay.classList.add('on');
     if(!started){ build(); started=true; }
     if(!running){ running=true; pClock.start(); frame(); }
@@ -855,6 +901,8 @@ fsmenu.querySelectorAll('a').forEach(a=>a.onclick=()=>fsmenu.classList.remove('o
     // tap cycles brightness/light intensity
     let b=pUniforms.uBright.value;
     pUniforms.uBright.value = b>1.4 ? 0.4 : b+0.35;
+    // tap triggers an immediate EM-cut pulse + light haptic
+    if(navigator.vibrate){ navigator.vibrate(22); }
     hint.classList.add('fade');
   });
   pcanvas.addEventListener('pointerup',()=>{ targetPointerAmt=0; });
